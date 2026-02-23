@@ -1,0 +1,15 @@
+[package]
+name = "hijacker2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+bytemuck = "1.25.0"
+clap = { version = "4.5.60", features = ["derive"] }
+env_logger = "0.11.9"
+log = "0.4.29"
+pipewire = "0.9.2"
+ringbuf = "0.4.8"
+serde_json = "1.0.149"
+symphonia = { version = "=0.5.4", features = ["aac", "mp3", "flac", "isomp4", "ogg", "vorbis"] }
