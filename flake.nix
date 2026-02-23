@@ -14,6 +14,11 @@
         lib,
         ...
       }: {
+        packages = rec {
+          hijacker2 = pkgs.callPackage ./package.nix {};
+          default = hijacker2;
+        };
+
         devShells.default = pkgs.mkShell rec {
           buildInputs = with pkgs; [
             pkg-config
@@ -23,6 +28,7 @@
 
             pipewire
           ];
+
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath buildInputs}";
           CPATH = lib.makeSearchPathOutput "dev" "include" buildInputs;
         };

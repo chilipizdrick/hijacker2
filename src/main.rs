@@ -592,20 +592,11 @@ fn get_default_metadata(
     Ok(Some(Rc::into_inner(default_metadata).unwrap().into_inner()))
 }
 
-fn select_audio_source_name(metadata: &DefaultMetadata) -> Option<&str> {
-    match (
-        &metadata.default_audio_source_name,
-        &metadata.default_configured_audio_source_name,
-    ) {
-        (Some(_), Some(default_configured_audio_source_name)) => {
-            Some(default_configured_audio_source_name)
-        }
-        (Some(default_audio_source_name), None) => Some(default_audio_source_name),
-        (None, Some(default_configured_audio_source_name)) => {
-            Some(default_configured_audio_source_name)
-        }
-        (None, None) => None,
-    }
+fn select_audio_source_name(metadata: &DefaultMetadata) -> Option<&String> {
+    metadata
+        .default_audio_source_name
+        .as_ref()
+        .or(metadata.default_configured_audio_source_name.as_ref())
 }
 
 #[derive(Debug)]
