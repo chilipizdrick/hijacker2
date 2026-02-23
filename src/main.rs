@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use clap::Parser;
 use pipewire::properties::{PropertiesBox, properties};
 use pipewire::registry::GlobalObject;
@@ -32,7 +32,7 @@ struct Args {
     /// Path to the audio file to be played
     pub file_path: String,
 
-    /// Name of the audio source node to use as the "microphone". If not specified, the default
+    /// Name of the audio source node to use as the reference "microphone". If not specified, the default
     /// audio source node will be used.
     #[arg(short, long)]
     audio_source_name: Option<String>,
@@ -63,7 +63,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     let codec_params = decoder.codec_params();
     let num_channels = codec_params
         .channels
-        .expect("Missing audio channels in codec parameters")
+        .ok_or(anyhow!("Missing audio channel data in codec parameters"))?
         .bits()
         .count_ones();
 
@@ -108,7 +108,10 @@ fn run(args: Args) -> anyhow::Result<()> {
             };
 
             let Some(name) = select_audio_source_name(&default_metadata) else {
-                bail!("Metadata object does not contain any audio source".to_string());
+                bail!(
+                    "Pipewire metadata object does not contain any default audio source"
+                        .to_string()
+                );
             };
 
             name.to_string()
@@ -377,7 +380,9 @@ fn register_registry_listener(
         .register()
 }
 
-fn audio_info_from_codec_parameters(codec_params: &CodecParameters) -> AudioInfoRaw {
+fn audio_info_from_codec_parameters(
+    codec_params: &CodecParameters,
+) -> anyhow::Result<AudioInfoRaw> {
     let mut audio_info = AudioInfoRaw::new();
 
     let format = match codec_params.sample_format {
@@ -398,12 +403,12 @@ fn audio_info_from_codec_parameters(codec_params: &CodecParameters) -> AudioInfo
     audio_info.set_rate(
         codec_params
             .sample_rate
-            .expect("Could not determine audio sample rate"),
+            .ok_or(anyhow!("Audio sample rate not found in codec parameters"))?,
     );
 
     let channels = codec_params
         .channels
-        .expect("Could not determine audio channels");
+        .ok_or(anyhow!("Audio channel data not found in codec parameters"))?;
     let num_channels = channels.bits().count_ones();
     audio_info.set_channels(num_channels);
 
@@ -442,16 +447,16 @@ fn audio_info_from_codec_parameters(codec_params: &CodecParameters) -> AudioInfo
     }
     audio_info.set_position(position);
 
-    audio_info
+    Ok(audio_info)
 }
 
 fn create_and_connect_stream<'a>(
     pw_conn: &'a PipewireConnection,
     codec_params: &CodecParameters,
-) -> Result<pw::stream::StreamBox<'a>, pw::Error> {
+) -> anyhow::Result<pw::stream::StreamBox<'a>> {
     let num_channels = codec_params
         .channels
-        .expect("Missing audio channels in codec parameters")
+        .ok_or(anyhow!("Missing audio channel data in codec parameters"))?
         .bits()
         .count_ones();
 
@@ -461,22 +466,21 @@ fn create_and_connect_stream<'a>(
         *pw::keys::MEDIA_ROLE => "Music",
         *pw::keys::AUDIO_CHANNELS => num_channels.to_string(),
     };
-    let stream = StreamBox::new(&pw_conn.core, "hijacker", props).unwrap();
+    let stream = StreamBox::new(&pw_conn.core, "hijacker", props)?;
 
     let stream_flags = StreamFlags::MAP_BUFFERS | StreamFlags::AUTOCONNECT;
 
-    let audio_info = audio_info_from_codec_parameters(codec_params);
+    let audio_info = audio_info_from_codec_parameters(codec_params)?;
     let object = pod::Object {
         type_: SPA_TYPE_OBJECT_Format,
         id: SPA_PARAM_EnumFormat,
         properties: audio_info.into(),
     };
-    let values: Vec<u8> =
-        PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(object))
-            .unwrap()
-            .0
-            .into_inner();
-    let mut params = [Pod::from_bytes(&values).unwrap()];
+    let pod_value = pod::Value::Object(object);
+    let values: Vec<u8> = PodSerializer::serialize(Cursor::new(Vec::new()), &pod_value)?
+        .0
+        .into_inner();
+    let mut params = [Pod::from_bytes(&values).ok_or(anyhow!("Could not serialize SPA pod"))?];
 
     stream.connect(Direction::Output, None, stream_flags, &mut params)?;
 
