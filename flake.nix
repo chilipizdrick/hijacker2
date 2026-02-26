@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    nix-github-actions = {
+      url = "github:nix-community/nix-github-actions";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = inputs:
@@ -33,5 +37,7 @@
           CPATH = lib.makeSearchPathOutput "dev" "include" buildInputs;
         };
       };
+
+      flake.githubActions = inputs.nix-github-actions.lib.mkGithubMatrix {checks = inputs.self.packages;};
     };
 }

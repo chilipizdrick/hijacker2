@@ -8,7 +8,7 @@ use pipewire::registry::GlobalObject;
 use pipewire::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pipewire::spa::pod::Pod;
 use pipewire::spa::pod::serialize::PodSerializer;
-use pipewire::spa::sys::{SPA_PARAM_EnumFormat, SPA_TYPE_OBJECT_Format};
+use pipewire::spa::sys::{SPA_PARAM_EnumFormat, SPA_TYPE_OBJECT_Format, spa_audio_channel};
 use pipewire::spa::utils::Direction;
 use pipewire::spa::utils::dict::ParsableValue;
 use pipewire::stream::{StreamBox, StreamFlags, StreamState};
@@ -33,7 +33,7 @@ use symphonia::core::sample::SampleFormat;
 
 use crate::cli_args::Args;
 
-/// Relied on user to call `pipewire::init()` and `pipewire::deinit()` before and after calling this.
+/// Relies on user to call `pipewire::init()` and `pipewire::deinit()` before and after calling this function.
 pub fn run(args: Args) -> anyhow::Result<()> {
     let (decoder, format_reader) = decode_audio_file(args.file_path)?;
 
@@ -87,12 +87,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .filter(|&o| o.type_ == ObjectType::Port)
         .collect();
 
-    let connection_targets: Vec<_> = connection_targets(&ports, &node_ids_to_connect_to);
+    let connection_targets = connection_targets(&ports, &node_ids_to_connect_to);
     log::debug!("Found following connection targets: {connection_targets:?}");
 
     let stream_node_id = stream.node_id();
 
-    let stream_ports: Vec<_> = node_ports(&ports, stream_node_id);
+    let stream_ports = node_audio_ports(&ports, stream_node_id);
     log::debug!("Stream ports: {stream_ports:?}");
 
     let stream_node = NodeWithPorts::new(stream_node_id, stream_ports);
@@ -115,160 +115,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 type PwObject = GlobalObject<PropertiesBox>;
 
-fn is_default_metadata_object(object: &PwObject) -> bool {
-    is_of_type_and_has_str_property_equal_to(
-        object,
-        ObjectType::Metadata,
-        "metadata.name",
-        "default",
-    )
-}
-
-fn play_audio_into_ring_buffer<P>(
-    mut producer: P,
-    mut decoder: Box<dyn Decoder + 'static>,
-    mut format_reader: Box<dyn FormatReader + 'static>,
-) where
-    P: Producer<Item = f32> + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut sample_buf = None;
-        while let Ok(packet) = format_reader.next_packet() {
-            let decoded = decoder
-                .decode(&packet)
-                .expect("Could not decode audio packet");
-
-            if sample_buf.is_none() {
-                let spec = *decoded.spec();
-                sample_buf = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
-            }
-
-            if let Some(ref mut buf) = sample_buf {
-                buf.copy_interleaved_ref(decoded);
-
-                let samples = buf.samples();
-                let mut current_sample_idx = 0;
-                let samples_len = samples.len();
-
-                while current_sample_idx < samples_len {
-                    let new_sample_idx =
-                        (current_sample_idx + producer.vacant_len()).min(samples_len);
-                    producer.push_slice(&samples[current_sample_idx..new_sample_idx]);
-                    current_sample_idx = new_sample_idx;
-                    if current_sample_idx < samples_len {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn register_core_done_listener(pw_conn: &PipewireConnection) -> pw::core::Listener {
-    let mainloop_weak = pw_conn.mainloop.downgrade();
-    pw_conn
-        .core
-        .add_listener_local()
-        .done(move |_, _| {
-            if let Some(loop_handle) = mainloop_weak.upgrade() {
-                log::debug!("Sync complete. Stopping pipewire loop...");
-                loop_handle.quit();
-            }
-        })
-        .register()
-}
-
-fn audio_info_from_codec_parameters(
-    codec_params: &CodecParameters,
-) -> anyhow::Result<AudioInfoRaw> {
-    let mut audio_info = AudioInfoRaw::new();
-
-    let format = match codec_params.sample_format {
-        Some(SampleFormat::U8) => AudioFormat::U8,
-        Some(SampleFormat::U16) => AudioFormat::U16,
-        Some(SampleFormat::U24) => AudioFormat::U24,
-        Some(SampleFormat::U32) => AudioFormat::U32,
-        Some(SampleFormat::S8) => AudioFormat::S8,
-        Some(SampleFormat::S16) => AudioFormat::S16,
-        Some(SampleFormat::S24) => AudioFormat::S24,
-        Some(SampleFormat::S32) => AudioFormat::S32,
-        Some(SampleFormat::F32) => AudioFormat::F32LE,
-        Some(SampleFormat::F64) => AudioFormat::F64LE,
-        None => AudioFormat::F32LE,
-    };
-    audio_info.set_format(format);
-
-    audio_info.set_rate(
-        codec_params
-            .sample_rate
-            .ok_or(anyhow!("Audio sample rate not found in codec parameters"))?,
-    );
-
-    let channels = codec_params
-        .channels
-        .ok_or(anyhow!("Audio channel data not found in codec parameters"))?;
-    let num_channels = channels.bits().count_ones();
-    audio_info.set_channels(num_channels);
-
-    let mut position = [0; pw::spa::param::audio::MAX_CHANNELS];
-    for (i, chan) in channels.iter().enumerate() {
-        use pw::spa::sys::*;
-        position[i] = match chan {
-            Channels::FRONT_LEFT => SPA_AUDIO_CHANNEL_FL,
-            Channels::FRONT_RIGHT => SPA_AUDIO_CHANNEL_FR,
-            Channels::FRONT_CENTRE => SPA_AUDIO_CHANNEL_FC,
-            Channels::LFE1 => SPA_AUDIO_CHANNEL_LFE,
-            Channels::REAR_LEFT => SPA_AUDIO_CHANNEL_RL,
-            Channels::REAR_RIGHT => SPA_AUDIO_CHANNEL_RR,
-            Channels::FRONT_LEFT_CENTRE => SPA_AUDIO_CHANNEL_FLC,
-            Channels::FRONT_RIGHT_CENTRE => SPA_AUDIO_CHANNEL_FRC,
-            Channels::REAR_CENTRE => SPA_AUDIO_CHANNEL_RC,
-            Channels::SIDE_LEFT => SPA_AUDIO_CHANNEL_SL,
-            Channels::SIDE_RIGHT => SPA_AUDIO_CHANNEL_SR,
-            Channels::TOP_CENTRE => SPA_AUDIO_CHANNEL_TC,
-            Channels::TOP_FRONT_LEFT => SPA_AUDIO_CHANNEL_TFL,
-            Channels::TOP_FRONT_CENTRE => SPA_AUDIO_CHANNEL_TFC,
-            Channels::TOP_FRONT_RIGHT => SPA_AUDIO_CHANNEL_TFR,
-            Channels::TOP_REAR_LEFT => SPA_AUDIO_CHANNEL_TRL,
-            Channels::TOP_REAR_CENTRE => SPA_AUDIO_CHANNEL_TRC,
-            Channels::TOP_REAR_RIGHT => SPA_AUDIO_CHANNEL_TRR,
-            Channels::REAR_LEFT_CENTRE => SPA_AUDIO_CHANNEL_RLC,
-            Channels::REAR_RIGHT_CENTRE => SPA_AUDIO_CHANNEL_RRC,
-            Channels::FRONT_LEFT_WIDE => SPA_AUDIO_CHANNEL_FLW,
-            Channels::FRONT_RIGHT_WIDE => SPA_AUDIO_CHANNEL_FRW,
-            Channels::FRONT_LEFT_HIGH => SPA_AUDIO_CHANNEL_FLH,
-            Channels::FRONT_CENTRE_HIGH => SPA_AUDIO_CHANNEL_FCH,
-            Channels::FRONT_RIGHT_HIGH => SPA_AUDIO_CHANNEL_FRH,
-            Channels::LFE2 => SPA_AUDIO_CHANNEL_LFE2,
-            _ => 0,
-        }
-    }
-    audio_info.set_position(position);
-
-    Ok(audio_info)
-}
-
-#[allow(clippy::type_complexity)]
-fn decode_audio_file(
-    file_path: impl AsRef<Path>,
-) -> Result<(Box<dyn Decoder>, Box<dyn FormatReader>), symphonia::core::errors::Error> {
-    let audio_source_file = File::open(&file_path)?;
-    let mss = MediaSourceStream::new(Box::new(audio_source_file), Default::default());
-    let format_reader = symphonia::default::get_probe()
-        .format(
-            &Default::default(),
-            mss,
-            &Default::default(),
-            &Default::default(),
-        )?
-        .format;
-
-    let track = &format_reader.tracks()[0];
-    let decoder =
-        symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
-    Ok((decoder, format_reader))
-}
-
 struct PipewireConnection {
     pub mainloop: pw::main_loop::MainLoopRc,
     pub core: pw::core::CoreRc,
@@ -290,67 +136,7 @@ impl PipewireConnection {
             registry,
         })
     }
-}
 
-#[derive(Debug, Default)]
-struct DefaultMetadata {
-    default_audio_source_name: Option<String>,
-    default_configured_audio_source_name: Option<String>,
-    default_audio_sink_name: Option<String>,
-    default_configured_audio_sink_name: Option<String>,
-}
-
-fn select_audio_source_name(metadata: &DefaultMetadata) -> Option<&String> {
-    metadata
-        .default_audio_source_name
-        .as_ref()
-        .or(metadata.default_configured_audio_source_name.as_ref())
-}
-
-#[derive(Debug, Clone)]
-struct NodeWithPorts {
-    id: u32,
-    ports: Vec<Port>,
-}
-
-impl NodeWithPorts {
-    fn new(id: u32, ports: Vec<Port>) -> Self {
-        Self { id, ports }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Port {
-    id: u32,
-    audio_channel: String,
-}
-
-impl Port {
-    fn new(id: u32, audio_channel: String) -> Self {
-        Self { id, audio_channel }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Link {
-    output_node: u32,
-    output_port: u32,
-    input_node: u32,
-    input_port: u32,
-}
-
-impl Link {
-    fn new(output_node: u32, output_port: u32, input_node: u32, input_port: u32) -> Self {
-        Self {
-            output_node,
-            output_port,
-            input_node,
-            input_port,
-        }
-    }
-}
-
-impl PipewireConnection {
     fn create_link(&self, link: Link) -> Result<pw::link::Link, pw::Error> {
         self.core.create_object(
             "link-factory",
@@ -544,12 +330,8 @@ impl PipewireConnection {
             .register()
     }
 
-    fn sync(&self) -> Result<pw::spa::utils::result::AsyncSeq, pw::Error> {
-        self.core.sync(0)
-    }
-
     /// Here we need to pass the stream to get its ports since they do not register before the
-    /// stream becomes active. Pipewire mainloop will be stopped after the stream is active.
+    /// stream becomes active. Pipewire main loop will be stopped after the stream is active.
     fn get_server_objects(&self, stream: &pw::stream::Stream) -> Result<Vec<PwObject>, pw::Error> {
         let objects = Rc::new(RefCell::new(Vec::new()));
         let registry_listener = self.register_registry_listener(&objects);
@@ -573,6 +355,61 @@ impl PipewireConnection {
         // NOTE: Needed for the line below not to panic
         drop(registry_listener);
         Ok(Rc::into_inner(objects).unwrap().into_inner())
+    }
+
+    fn sync(&self) -> Result<pw::spa::utils::result::AsyncSeq, pw::Error> {
+        self.core.sync(0)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DefaultMetadata {
+    default_audio_source_name: Option<String>,
+    default_configured_audio_source_name: Option<String>,
+    default_audio_sink_name: Option<String>,
+    default_configured_audio_sink_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NodeWithPorts {
+    id: u32,
+    ports: Vec<Port>,
+}
+
+impl NodeWithPorts {
+    fn new(id: u32, ports: Vec<Port>) -> Self {
+        Self { id, ports }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Port {
+    id: u32,
+    audio_channel: String,
+}
+
+impl Port {
+    fn new(id: u32, audio_channel: String) -> Self {
+        Self { id, audio_channel }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Link {
+    output_node: u32,
+    output_port: u32,
+    input_node: u32,
+    input_port: u32,
+}
+
+impl Link {
+    fn new(output_node: u32, output_port: u32, input_node: u32, input_port: u32) -> Self {
+        Self {
+            output_node,
+            output_port,
+            input_node,
+            input_port,
+        }
     }
 }
 
@@ -648,13 +485,13 @@ fn connection_targets(ports: &[&PwObject], node_ids: &[u32]) -> Vec<NodeWithPort
     node_ids
         .iter()
         .map(|&node_id| {
-            let ports = node_input_ports_with_audio_channel(ports, node_id);
+            let ports = node_input_audio_ports(ports, node_id);
             NodeWithPorts::new(node_id, ports)
         })
         .collect()
 }
 
-fn node_input_ports_with_audio_channel(ports: &[&PwObject], node_id: u32) -> Vec<Port> {
+fn node_input_audio_ports(ports: &[&PwObject], node_id: u32) -> Vec<Port> {
     let mut result = Vec::new();
 
     for port in ports {
@@ -671,7 +508,7 @@ fn node_input_ports_with_audio_channel(ports: &[&PwObject], node_id: u32) -> Vec
     result
 }
 
-fn node_ports(ports: &[&PwObject], node_id: u32) -> Vec<Port> {
+fn node_audio_ports(ports: &[&PwObject], node_id: u32) -> Vec<Port> {
     ports
         .iter()
         .filter(|&o| is_of_type_and_has_property_equal_to(o, ObjectType::Port, "node.id", node_id))
@@ -685,4 +522,174 @@ fn node_ports(ports: &[&PwObject], node_id: u32) -> Vec<Port> {
             Port::new(o.id, audio_channel)
         })
         .collect()
+}
+
+fn is_default_metadata_object(object: &PwObject) -> bool {
+    is_of_type_and_has_str_property_equal_to(
+        object,
+        ObjectType::Metadata,
+        "metadata.name",
+        "default",
+    )
+}
+
+fn play_audio_into_ring_buffer<P>(
+    mut producer: P,
+    mut decoder: Box<dyn Decoder + 'static>,
+    mut format_reader: Box<dyn FormatReader + 'static>,
+) where
+    P: Producer<Item = f32> + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut sample_buf = None;
+        while let Ok(packet) = format_reader.next_packet() {
+            let decoded = decoder
+                .decode(&packet)
+                .expect("Could not decode audio packet");
+
+            if sample_buf.is_none() {
+                let spec = *decoded.spec();
+                sample_buf = Some(SampleBuffer::new(decoded.capacity() as u64, spec));
+            }
+
+            if let Some(ref mut buf) = sample_buf {
+                buf.copy_interleaved_ref(decoded);
+
+                let samples = buf.samples();
+                let mut current_sample_idx = 0;
+                let samples_len = samples.len();
+
+                while current_sample_idx < samples_len {
+                    let new_sample_idx =
+                        (current_sample_idx + producer.vacant_len()).min(samples_len);
+                    producer.push_slice(&samples[current_sample_idx..new_sample_idx]);
+                    current_sample_idx = new_sample_idx;
+                    if current_sample_idx < samples_len {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn register_core_done_listener(pw_conn: &PipewireConnection) -> pw::core::Listener {
+    let mainloop_weak = pw_conn.mainloop.downgrade();
+    pw_conn
+        .core
+        .add_listener_local()
+        .done(move |_, _| {
+            if let Some(loop_handle) = mainloop_weak.upgrade() {
+                log::debug!("Sync complete. Stopping pipewire loop...");
+                loop_handle.quit();
+            }
+        })
+        .register()
+}
+
+fn sample_format_to_audio_format(sample_format: SampleFormat) -> AudioFormat {
+    match sample_format {
+        SampleFormat::U8 => AudioFormat::U8,
+        SampleFormat::U16 => AudioFormat::U16,
+        SampleFormat::U24 => AudioFormat::U24,
+        SampleFormat::U32 => AudioFormat::U32,
+        SampleFormat::S8 => AudioFormat::S8,
+        SampleFormat::S16 => AudioFormat::S16,
+        SampleFormat::S24 => AudioFormat::S24,
+        SampleFormat::S32 => AudioFormat::S32,
+        SampleFormat::F32 => AudioFormat::F32LE,
+        SampleFormat::F64 => AudioFormat::F64LE,
+    }
+}
+
+fn channels_to_spa_audio_channel(chan: Channels) -> spa_audio_channel {
+    use pw::spa::sys::*;
+    match chan {
+        Channels::FRONT_LEFT => SPA_AUDIO_CHANNEL_FL,
+        Channels::FRONT_RIGHT => SPA_AUDIO_CHANNEL_FR,
+        Channels::FRONT_CENTRE => SPA_AUDIO_CHANNEL_FC,
+        Channels::LFE1 => SPA_AUDIO_CHANNEL_LFE,
+        Channels::REAR_LEFT => SPA_AUDIO_CHANNEL_RL,
+        Channels::REAR_RIGHT => SPA_AUDIO_CHANNEL_RR,
+        Channels::FRONT_LEFT_CENTRE => SPA_AUDIO_CHANNEL_FLC,
+        Channels::FRONT_RIGHT_CENTRE => SPA_AUDIO_CHANNEL_FRC,
+        Channels::REAR_CENTRE => SPA_AUDIO_CHANNEL_RC,
+        Channels::SIDE_LEFT => SPA_AUDIO_CHANNEL_SL,
+        Channels::SIDE_RIGHT => SPA_AUDIO_CHANNEL_SR,
+        Channels::TOP_CENTRE => SPA_AUDIO_CHANNEL_TC,
+        Channels::TOP_FRONT_LEFT => SPA_AUDIO_CHANNEL_TFL,
+        Channels::TOP_FRONT_CENTRE => SPA_AUDIO_CHANNEL_TFC,
+        Channels::TOP_FRONT_RIGHT => SPA_AUDIO_CHANNEL_TFR,
+        Channels::TOP_REAR_LEFT => SPA_AUDIO_CHANNEL_TRL,
+        Channels::TOP_REAR_CENTRE => SPA_AUDIO_CHANNEL_TRC,
+        Channels::TOP_REAR_RIGHT => SPA_AUDIO_CHANNEL_TRR,
+        Channels::REAR_LEFT_CENTRE => SPA_AUDIO_CHANNEL_RLC,
+        Channels::REAR_RIGHT_CENTRE => SPA_AUDIO_CHANNEL_RRC,
+        Channels::FRONT_LEFT_WIDE => SPA_AUDIO_CHANNEL_FLW,
+        Channels::FRONT_RIGHT_WIDE => SPA_AUDIO_CHANNEL_FRW,
+        Channels::FRONT_LEFT_HIGH => SPA_AUDIO_CHANNEL_FLH,
+        Channels::FRONT_CENTRE_HIGH => SPA_AUDIO_CHANNEL_FCH,
+        Channels::FRONT_RIGHT_HIGH => SPA_AUDIO_CHANNEL_FRH,
+        Channels::LFE2 => SPA_AUDIO_CHANNEL_LFE2,
+        _ => 0,
+    }
+}
+
+fn audio_info_from_codec_parameters(
+    codec_params: &CodecParameters,
+) -> anyhow::Result<AudioInfoRaw> {
+    let mut audio_info = AudioInfoRaw::new();
+
+    let format = codec_params
+        .sample_format
+        .map(sample_format_to_audio_format)
+        .unwrap_or(AudioFormat::F32LE);
+    audio_info.set_format(format);
+
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or(anyhow!("Audio sample rate not found in codec parameters"))?;
+    audio_info.set_rate(sample_rate);
+
+    let channels = codec_params
+        .channels
+        .ok_or(anyhow!("Audio channel data not found in codec parameters"))?;
+    let num_channels = channels.bits().count_ones();
+    audio_info.set_channels(num_channels);
+
+    let mut position = [0; pw::spa::param::audio::MAX_CHANNELS];
+    for (i, chan) in channels.iter().enumerate() {
+        position[i] = channels_to_spa_audio_channel(chan);
+    }
+    audio_info.set_position(position);
+
+    Ok(audio_info)
+}
+
+#[allow(clippy::type_complexity)]
+fn decode_audio_file(
+    file_path: impl AsRef<Path>,
+) -> Result<(Box<dyn Decoder>, Box<dyn FormatReader>), symphonia::core::errors::Error> {
+    let audio_source_file = File::open(&file_path)?;
+    let mss = MediaSourceStream::new(Box::new(audio_source_file), Default::default());
+
+    let hint = Default::default();
+    let format_ops = Default::default();
+    let metadata_ops = Default::default();
+    let format_reader = symphonia::default::get_probe()
+        .format(&hint, mss, &format_ops, &metadata_ops)?
+        .format;
+
+    let track = &format_reader.tracks()[0];
+    let decoder =
+        symphonia::default::get_codecs().make(&track.codec_params, &Default::default())?;
+
+    Ok((decoder, format_reader))
+}
+
+fn select_audio_source_name(metadata: &DefaultMetadata) -> Option<&String> {
+    metadata
+        .default_audio_source_name
+        .as_ref()
+        .or(metadata.default_configured_audio_source_name.as_ref())
 }
